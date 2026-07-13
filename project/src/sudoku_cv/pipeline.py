@@ -65,7 +65,7 @@ class SudokuPipeline:
                     empty_threshold=self.config.min_cell_foreground_ratio,
                 )
 
-                if prediction == self.config.empty_digit_class or confidence < self.config.digit_confidence_threshold:
+                if confidence < self.config.digit_confidence_threshold:
                     row.append(0)
                 else:
                     row.append(prediction)
@@ -129,6 +129,77 @@ class SudokuPipeline:
         with (debug_dir / "run_metadata.json").open("w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2)
         LOGGER.info("Saved pipeline debug artifacts to %s", debug_dir)
+
+    def _save_prediction_visualization(
+        self,
+        warped_board: np.ndarray,
+        board: List[List[int]],
+        confidences: List[List[float]],
+        output_path: Path,
+    ) -> None:
+        """Save the detected board next to a cell-by-cell prediction grid."""
+        board_size = max(450, int(warped_board.shape[0]))
+        actual_board = cv2.resize(warped_board, (board_size, board_size))
+        if actual_board.ndim == 2:
+            actual_board = cv2.cvtColor(actual_board, cv2.COLOR_GRAY2BGR)
+
+        prediction_board = np.full((board_size, board_size, 3), 255, dtype=np.uint8)
+        cell_size = board_size // 9
+        for row_index in range(9):
+            for col_index in range(9):
+                x1, y1 = col_index * cell_size, row_index * cell_size
+                x2 = (col_index + 1) * cell_size if col_index == 8 else (col_index + 1) * cell_size
+                y2 = (row_index + 1) * cell_size if row_index == 8 else (row_index + 1) * cell_size
+                value = board[row_index][col_index]
+                confidence = confidences[row_index][col_index]
+                label = "-" if value == 0 else str(value)
+                cv2.putText(
+                    prediction_board,
+                    label,
+                    (x1 + cell_size // 3, y1 + int(cell_size * 0.48)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 0, 180) if value == 0 else (30, 100, 30),
+                    2,
+                    lineType=cv2.LINE_AA,
+                )
+                cv2.putText(
+                    prediction_board,
+                    f"{confidence * 100:.0f}%",
+                    (x1 + 4, y1 + int(cell_size * 0.82)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    (70, 70, 70),
+                    1,
+                    lineType=cv2.LINE_AA,
+                )
+
+        for index in range(10):
+            position = index * cell_size
+            thickness = 2 if index % 3 == 0 else 1
+            cv2.line(prediction_board, (position, 0), (position, board_size), (0, 0, 0), thickness)
+            cv2.line(prediction_board, (0, position), (board_size, position), (0, 0, 0), thickness)
+
+        title_height = 48
+        actual_panel = cv2.copyMakeBorder(
+            actual_board, title_height, 0, 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+        )
+        prediction_panel = cv2.copyMakeBorder(
+            prediction_board, title_height, 0, 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+        )
+        cv2.putText(actual_panel, "Actual board", (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+        cv2.putText(
+            prediction_panel,
+            "Predictions (digit / confidence)",
+            (12, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (0, 0, 0),
+            2,
+        )
+        visualization = cv2.hconcat([actual_panel, prediction_panel])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(output_path), visualization)
 
     def solve_board(self, board: List[List[int]]) -> Tuple[List[List[int]], bool]:
         solved_board = [row[:] for row in board]
@@ -195,6 +266,12 @@ class SudokuPipeline:
             debug_path.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(debug_path / "warped_board.jpg"), warped_board)
             self._save_debug_artifacts(debug_path, image, board, confidences, solved_board, matrix)
+            self._save_prediction_visualization(
+                warped_board,
+                board,
+                confidences,
+                debug_path / "05_predictions_with_confidence.jpg",
+            )
             cv2.imwrite(str(debug_path / "04_solution_overlay.jpg"), overlay)
 
         return {

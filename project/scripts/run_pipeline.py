@@ -43,6 +43,7 @@ def main():
     print(f"Saved overlay to {Path(args.save_overlay)}")
     if args.debug:
         print(f"Saved debug artifacts to {Path(args.debug_dir)}")
+        print(f"Saved prediction visualization to {Path(args.debug_dir) / '05_predictions_with_confidence.jpg'}")
 
 
 if __name__ == "__main__":

@@ -31,10 +31,10 @@ class DigitClassifier(nn.Module):
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 128),
+            nn.Linear(128 * 4 * 4, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
-            nn.Linear(128, num_classes),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -44,11 +44,6 @@ class DigitClassifier(nn.Module):
 
 def _render_digit(digit: int, image_size: int, rng: np.random.Generator) -> np.ndarray:
     canvas = np.full((image_size, image_size), 255, dtype=np.uint8)
-    if digit == 0:
-        noise = rng.integers(0, 15, size=(image_size, image_size), dtype=np.uint8)
-        canvas = np.clip(canvas - noise, 0, 255).astype(np.uint8)
-        return canvas
-
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = rng.uniform(0.8, 1.3)
     thickness = int(rng.integers(1, 3))
@@ -107,6 +102,26 @@ def _standardize_image(image: np.ndarray, image_size: int = 28) -> np.ndarray:
     # HODA exports commonly use black ink on a white background, unlike MNIST.
     if float(image.mean()) > 0.5:
         image = 1.0 - image
+
+    # Remove edge noise, especially grid lines that may remain in extracted
+    # Sudoku cells, before resizing the digit to the model's input size.
+    mask = (image > 0.1).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, width, height = cv2.boundingRect(largest_contour)
+        cropped = image[y:y + height, x:x + width]
+        padding = max(1, int(round(max(width, height) * 0.15)))
+        image = cv2.copyMakeBorder(
+            cropped,
+            padding,
+            padding,
+            padding,
+            padding,
+            cv2.BORDER_CONSTANT,
+            value=0,
+        )
+
     image = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_AREA)
     return np.clip(image, 0.0, 1.0).astype(np.float32)
 
@@ -326,11 +341,18 @@ def load_digit_model(model_path: str, device: torch.device) -> DigitClassifier:
 
 def classify_digit(model: nn.Module, cell_image: np.ndarray, device: torch.device, empty_threshold: float = 0.02) -> Tuple[int, float]:
     gray = cell_image.astype(np.float32)
+    if gray.size == 0:
+        return 0, 1.0
     foreground_ratio = float(np.count_nonzero(gray > 0)) / gray.size
     if foreground_ratio < empty_threshold:
         return 0, 1.0
 
-    tensor = torch.from_numpy(gray / 255.0).unsqueeze(0).unsqueeze(0).float().to(device)
+    standardized = _standardize_image(cell_image)
+    standardized_foreground_ratio = float(np.count_nonzero(standardized > 0.1)) / standardized.size
+    if standardized_foreground_ratio < empty_threshold:
+        return 0, 1.0
+
+    tensor = torch.from_numpy(standardized).unsqueeze(0).unsqueeze(0).float().to(device)
     with torch.no_grad():
         logits = model(tensor)
         probabilities = torch.softmax(logits, dim=1)[0]
