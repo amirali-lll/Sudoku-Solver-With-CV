@@ -257,60 +257,90 @@ def split_cells(board_image: np.ndarray) -> List[np.ndarray]:
         for column in range(9):
             y1, y2 = boundaries_y[row], boundaries_y[row + 1]
             x1, x2 = boundaries_x[column], boundaries_x[column + 1]
-            margin_y = max(1, round((y2 - y1) * 0.10))
-            margin_x = max(1, round((x2 - x1) * 0.10))
+            # Keep almost the entire cell so strokes near the edge are not
+            # clipped.  Grid/noise removal is handled after thresholding.
+            margin_y = max(1, round((y2 - y1) * 0.024))
+            margin_x = max(1, round((x2 - x1) * 0.024))
             cells.append(board_image[y1 + margin_y:y2 - margin_y, x1 + margin_x:x2 - margin_x].copy())
     return cells
 
-
 def extract_digit_image(cell_image: np.ndarray, output_size: int = 28) -> np.ndarray:
-    """Return a centered white-on-black digit image, or black for an empty cell."""
+    """Return a properly padded white-on-black digit image, or black for an empty cell."""
     gray = cv2.cvtColor(cell_image, cv2.COLOR_BGR2GRAY) if cell_image.ndim == 3 else cell_image
     
-    # --- FIX 1: Guard against Otsu hallucinating noise on blank cells ---
-    # If standard deviation is low, the cell is uniform and therefore empty.
+    # Guard against Otsu hallucinating noise on blank cells
     _, std_dev = cv2.meanStdDev(gray)
-    if std_dev[0][0] < 15.0:  # 15.0 is a solid baseline; tweak between 10-20 if needed
+    if std_dev[0][0] < 15.0:  
         return np.zeros((output_size, output_size), dtype=np.uint8)
-    # --------------------------------------------------------------------
+        
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     thresholded = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    border = max(1, round(min(thresholded.shape) * 0.08))
-    thresholded[:border] = 0
-    thresholded[-border:] = 0
-    thresholded[:, :border] = 0
-    thresholded[:, -border:] = 0
 
-    # Empty cells often contain isolated scanner/compression speckles.  Do
-    # not let one of those speckles become the "digit" sent to the model.
-    # Connected-component filtering is preferable to simply selecting the
-    # largest contour because it also removes several small noise blobs.
+    # --- 1. ROBUST GRID LINE REMOVAL (Flood Fill) ---
+    # Any pixel touching the outer boundary is assumed to be part of the grid or noise.
+    # We flood-fill black (0) from all edges to erase these lines safely.
+    h, w = thresholded.shape
+    mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    
+    # Flood fill from top and bottom edges
+    for x in range(w):
+        if thresholded[0, x] == 255: cv2.floodFill(thresholded, mask, (x, 0), 0)
+        if thresholded[h - 1, x] == 255: cv2.floodFill(thresholded, mask, (x, h - 1), 0)
+    # Flood fill from left and right edges
+    for y in range(h):
+        if thresholded[y, 0] == 255: cv2.floodFill(thresholded, mask, (0, y), 0)
+        if thresholded[y, w - 1] == 255: cv2.floodFill(thresholded, mask, (w - 1, y), 0)
+
+    # --- 2. ISOLATE THE DIGIT ---
+    # Now, what is left inside should strictly be the digit and maybe isolated noise.
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
         thresholded, connectivity=8
     )
-    minimum_component_area = max(8, round(thresholded.size * 0.01))
-    keep = np.zeros_like(thresholded)
-    component_areas: list[int] = []
-    for component_index in range(1, component_count):
-        area = int(stats[component_index, cv2.CC_STAT_AREA])
-        if area >= minimum_component_area:
-            keep[labels == component_index] = 255
-            component_areas.append(area)
-
-    # A genuine printed digit has substantially more ink than the residual
-    # noise left in a blank cell.  This second guard is intentionally applied
-    # before resizing, so interpolation cannot enlarge a noise component.
-    if not component_areas or max(component_areas) < max(12, round(thresholded.size * 0.015)):
+    
+    # If only the background remains
+    if component_count < 2:
+        return np.zeros((output_size, output_size), dtype=np.uint8)
+        
+    # Find the largest component (excluding background at index 0)
+    largest_idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    area = stats[largest_idx, cv2.CC_STAT_AREA]
+    
+    # Noise check: if the largest remaining blob is tiny, it's an empty cell
+    if area < max(12, round(thresholded.size * 0.015)):
+        return np.zeros((output_size, output_size), dtype=np.uint8)
+        
+    # Extract bounding box of the digit
+    x = stats[largest_idx, cv2.CC_STAT_LEFT]
+    y = stats[largest_idx, cv2.CC_STAT_TOP]
+    width = stats[largest_idx, cv2.CC_STAT_WIDTH]
+    height = stats[largest_idx, cv2.CC_STAT_HEIGHT]
+    
+    # Reject remaining artifacts that are too long/thin to be a digit
+    aspect = width / max(height, 1)
+    if aspect > 2.5 or aspect < 0.15:
         return np.zeros((output_size, output_size), dtype=np.uint8)
 
-    contours, _ = cv2.findContours(keep, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return np.zeros((output_size, output_size), dtype=np.uint8)
-    largest = max(contours, key=cv2.contourArea)
-    x, y, width, height = cv2.boundingRect(largest)
     digit = thresholded[y:y + height, x:x + width]
-    square_size = max(width, height)
-    square = np.zeros((square_size, square_size), dtype=np.uint8)
-    offset_y, offset_x = (square_size - height) // 2, (square_size - width) // 2
-    square[offset_y:offset_y + height, offset_x:offset_x + width] = digit
-    return cv2.resize(square, (output_size, output_size), interpolation=cv2.INTER_AREA)
+    
+    # --- 3. CLASSIFIER-SAFE PADDING ---
+    # Neural networks expect padding. We scale the digit to take up roughly 75% 
+    # of the output size, then center it.
+    inner_size = int(output_size * 0.75) 
+    
+    if width > height:
+        new_w = inner_size
+        new_h = max(1, int(np.round(inner_size * (height / width))))
+    else:
+        new_h = inner_size
+        new_w = max(1, int(np.round(inner_size * (width / height))))
+        
+    resized_digit = cv2.resize(digit, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Create the final black canvas and center the resized digit
+    final_image = np.zeros((output_size, output_size), dtype=np.uint8)
+    start_y = (output_size - new_h) // 2
+    start_x = (output_size - new_w) // 2
+    
+    final_image[start_y:start_y + new_h, start_x:start_x + new_w] = resized_digit
+    
+    return final_image
