@@ -7,6 +7,10 @@ env/
 *.onnx
 outputs/
 data/
+raw_suduku/
+HW5_400521324/
 
+
+*.pdf
 .DS_Store
 

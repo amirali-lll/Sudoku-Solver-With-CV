@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: sudoku-cv
+Version: 0.1.0
+Summary: Sudoku detection, digit recognition, and solving pipeline
+Requires-Python: >=3.10
