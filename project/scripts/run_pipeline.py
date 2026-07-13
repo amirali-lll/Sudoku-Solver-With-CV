@@ -25,13 +25,18 @@ def parse_args():
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    pipeline = SudokuPipeline(model_path=args.model)
-    result = pipeline.solve_image(
-        args.image,
-        save_overlay_path=args.save_overlay,
-        debug_dir=args.debug_dir,
-        debug=args.debug,
-    )
+    logging.info("Command received: image=%s model=%s", args.image, args.model)
+    try:
+        pipeline = SudokuPipeline(model_path=args.model)
+        result = pipeline.solve_image(
+            args.image,
+            save_overlay_path=args.save_overlay,
+            debug_dir=args.debug_dir,
+            debug=args.debug,
+        )
+    except Exception:
+        logging.exception("Pipeline failed")
+        raise
 
     print("Detected board:")
     for row in result["board"]:

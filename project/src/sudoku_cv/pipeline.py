@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -28,16 +29,22 @@ class SudokuPipeline:
     def __init__(self, model_path: str, config: SudokuConfig | None = None):
         self.config = config or SudokuConfig()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        LOGGER.info("Loading digit model: %s (device=%s)", model_path, self.device)
         self.model = load_digit_model(model_path, self.device)
+        LOGGER.info("Digit model loaded successfully")
 
     def detect_board(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        return extract_board(image, size=self.config.board_size)
+        LOGGER.info("Detecting Sudoku board in image with shape %s", image.shape)
+        warped_board, matrix = extract_board(image, size=self.config.board_size)
+        LOGGER.info("Board detected and warped to %s", warped_board.shape)
+        return warped_board, matrix
 
     def recognize_board(
         self,
         warped_board: np.ndarray,
         debug_dir: Path | None = None,
     ) -> Tuple[List[List[int]], List[List[float]]]:
+        LOGGER.info("Splitting warped board into 81 cells")
         cells = split_cells(warped_board)
         board: List[List[int]] = []
         confidences: List[List[float]] = []
@@ -73,7 +80,14 @@ class SudokuPipeline:
 
             board.append(row)
             confidences.append(row_confidence)
+            LOGGER.info(
+                "Recognized row %d/9: %s | confidences: %s",
+                row_index + 1,
+                row,
+                " ".join(f"{value:.2f}" for value in row_confidence),
+            )
 
+        LOGGER.info("Digit recognition complete: %d filled cells", sum(value != 0 for row in board for value in row))
         return board, confidences
 
     def _save_debug_artifacts(
@@ -203,7 +217,17 @@ class SudokuPipeline:
 
     def solve_board(self, board: List[List[int]]) -> Tuple[List[List[int]], bool]:
         solved_board = [row[:] for row in board]
-        solvable = solve_sudoku(solved_board)
+        LOGGER.info("Starting backtracking solver (time limit=%.2f seconds)", self.config.solver_timeout_seconds)
+        started = time.monotonic()
+        solvable = solve_sudoku(
+            solved_board,
+            time_limit_seconds=self.config.solver_timeout_seconds,
+        )
+        LOGGER.info(
+            "Backtracking solver finished in %.3f seconds: solvable=%s",
+            time.monotonic() - started,
+            solvable,
+        )
         return solved_board, solvable
 
     def render_solution(
@@ -249,18 +273,25 @@ class SudokuPipeline:
         debug_dir: str | None = None,
         debug: bool = False,
     ) -> Dict[str, object]:
+        LOGGER.info("Starting pipeline for image: %s", image_path)
+        LOGGER.info("Output overlay: %s | debug=%s", save_overlay_path, debug)
         image = load_image(image_path)
+        LOGGER.info("Image loaded successfully: shape=%s", image.shape)
         warped_board, matrix = self.detect_board(image)
         debug_path = Path(debug_dir) if debug and debug_dir is not None else None
         board, confidences = self.recognize_board(warped_board, debug_dir=debug_path)
+        LOGGER.info("Solving recognized board")
         solved_board, solvable = self.solve_board(board)
+        LOGGER.info("Solver finished: solvable=%s", solvable)
 
         overlay = self.render_solution(image, board, solved_board, matrix, warped_size=self.config.board_size)
 
         if save_overlay_path is not None:
             output_path = Path(save_overlay_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(output_path), overlay)
+            if not cv2.imwrite(str(output_path), overlay):
+                raise IOError(f"Could not write overlay image: {output_path}")
+            LOGGER.info("Saved overlay: %s", output_path)
 
         if debug_path is not None:
             debug_path.mkdir(parents=True, exist_ok=True)
@@ -273,7 +304,9 @@ class SudokuPipeline:
                 debug_path / "05_predictions_with_confidence.jpg",
             )
             cv2.imwrite(str(debug_path / "04_solution_overlay.jpg"), overlay)
+            LOGGER.info("Saved debug artifacts: %s", debug_path)
 
+        LOGGER.info("Pipeline completed successfully")
         return {
             "board": board,
             "confidences": confidences,

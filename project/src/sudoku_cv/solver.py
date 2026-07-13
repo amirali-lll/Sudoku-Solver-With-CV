@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import List, Optional, Sequence, Tuple
 
 
@@ -32,17 +33,43 @@ def is_valid(board: Sequence[Sequence[int]], number: int, position: Tuple[int, i
     return True
 
 
-def solve_sudoku(board: Board) -> bool:
-    empty = find_empty(board)
-    if empty is None:
-        return True
+class SolverTimeoutError(TimeoutError):
+    """Raised internally when the Sudoku search exceeds its time budget."""
 
-    row_index, col_index = empty
-    for number in range(1, 10):
-        if is_valid(board, number, (row_index, col_index)):
-            board[row_index][col_index] = number
-            if solve_sudoku(board):
-                return True
-            board[row_index][col_index] = 0
 
-    return False
+def solve_sudoku(board: Board, time_limit_seconds: float | None = 5.0) -> bool:
+    """Solve ``board`` in place, returning ``False`` when unsolvable or timed out.
+
+    ``time_limit_seconds=None`` disables the limit.  When the limit is reached,
+    the board is restored to its state before this function was called.
+    """
+    if time_limit_seconds is not None and time_limit_seconds <= 0:
+        raise ValueError("time_limit_seconds must be positive or None")
+
+    deadline = None if time_limit_seconds is None else time.monotonic() + time_limit_seconds
+    original_board = [row[:] for row in board]
+
+    def search() -> bool:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise SolverTimeoutError
+
+        empty = find_empty(board)
+        if empty is None:
+            return True
+
+        row_index, col_index = empty
+        for number in range(1, 10):
+            if is_valid(board, number, (row_index, col_index)):
+                board[row_index][col_index] = number
+                if search():
+                    return True
+                board[row_index][col_index] = 0
+
+        return False
+
+    try:
+        return search()
+    except SolverTimeoutError:
+        for row_index, row in enumerate(original_board):
+            board[row_index][:] = row
+        return False

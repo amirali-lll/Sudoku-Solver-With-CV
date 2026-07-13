@@ -242,10 +242,9 @@ def warp_board(image: np.ndarray, contour: np.ndarray, size: int = 450) -> Tuple
 
 def extract_board(image: np.ndarray, size: int = 450) -> Tuple[np.ndarray, np.ndarray]:
     preprocessed = preprocess_for_contours(image)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) # Fix: generate gray image here
-    contour = find_board_contour(preprocessed, gray_image=gray) # Fix: pass gray image down
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    contour = find_board_contour(preprocessed, gray_image=gray)
     return warp_board(image, contour, size=size)
-    return _warp(image, contour, size)
 
 
 def split_cells(board_image: np.ndarray) -> List[np.ndarray]:
@@ -257,90 +256,111 @@ def split_cells(board_image: np.ndarray) -> List[np.ndarray]:
         for column in range(9):
             y1, y2 = boundaries_y[row], boundaries_y[row + 1]
             x1, x2 = boundaries_x[column], boundaries_x[column + 1]
-            # Keep almost the entire cell so strokes near the edge are not
-            # clipped.  Grid/noise removal is handled after thresholding.
-            margin_y = max(1, round((y2 - y1) * 0.024))
-            margin_x = max(1, round((x2 - x1) * 0.024))
+            # Keep almost the entire cell.  Grid removal is performed after
+            # thresholding, so a large crop here could clip a real stroke.
+            margin_y = max(1, round((y2 - y1) * 0.015))
+            margin_x = max(1, round((x2 - x1) * 0.015))
             cells.append(board_image[y1 + margin_y:y2 - margin_y, x1 + margin_x:x2 - margin_x].copy())
     return cells
 
-def extract_digit_image(cell_image: np.ndarray, output_size: int = 28) -> np.ndarray:
-    """Return a properly padded white-on-black digit image, or black for an empty cell."""
-    gray = cv2.cvtColor(cell_image, cv2.COLOR_BGR2GRAY) if cell_image.ndim == 3 else cell_image
-    
-    # Guard against Otsu hallucinating noise on blank cells
-    _, std_dev = cv2.meanStdDev(gray)
-    if std_dev[0][0] < 15.0:  
-        return np.zeros((output_size, output_size), dtype=np.uint8)
-        
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    thresholded = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
 
-    # --- 1. ROBUST GRID LINE REMOVAL (Flood Fill) ---
-    # Any pixel touching the outer boundary is assumed to be part of the grid or noise.
-    # We flood-fill black (0) from all edges to erase these lines safely.
-    h, w = thresholded.shape
-    mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    
-    # Flood fill from top and bottom edges
-    for x in range(w):
-        if thresholded[0, x] == 255: cv2.floodFill(thresholded, mask, (x, 0), 0)
-        if thresholded[h - 1, x] == 255: cv2.floodFill(thresholded, mask, (x, h - 1), 0)
-    # Flood fill from left and right edges
-    for y in range(h):
-        if thresholded[y, 0] == 255: cv2.floodFill(thresholded, mask, (0, y), 0)
-        if thresholded[y, w - 1] == 255: cv2.floodFill(thresholded, mask, (w - 1, y), 0)
-
-    # --- 2. ISOLATE THE DIGIT ---
-    # Now, what is left inside should strictly be the digit and maybe isolated noise.
-    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        thresholded, connectivity=8
+def _select_digit_component(mask: np.ndarray) -> tuple[int, int, int, int, int] | None:
+    """Select the most digit-like component rather than simply the largest blob."""
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
     )
-    
-    # If only the background remains
-    if component_count < 2:
-        return np.zeros((output_size, output_size), dtype=np.uint8)
-        
-    # Find the largest component (excluding background at index 0)
-    largest_idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    area = stats[largest_idx, cv2.CC_STAT_AREA]
-    
-    # Noise check: if the largest remaining blob is tiny, it's an empty cell
-    if area < max(12, round(thresholded.size * 0.015)):
-        return np.zeros((output_size, output_size), dtype=np.uint8)
-        
-    # Extract bounding box of the digit
-    x = stats[largest_idx, cv2.CC_STAT_LEFT]
-    y = stats[largest_idx, cv2.CC_STAT_TOP]
-    width = stats[largest_idx, cv2.CC_STAT_WIDTH]
-    height = stats[largest_idx, cv2.CC_STAT_HEIGHT]
-    
-    # Reject remaining artifacts that are too long/thin to be a digit
-    aspect = width / max(height, 1)
-    if aspect > 2.5 or aspect < 0.15:
-        return np.zeros((output_size, output_size), dtype=np.uint8)
+    if component_count <= 1:
+        return None
 
-    digit = thresholded[y:y + height, x:x + width]
-    
-    # --- 3. CLASSIFIER-SAFE PADDING ---
-    # Neural networks expect padding. We scale the digit to take up roughly 75% 
-    # of the output size, then center it.
-    inner_size = int(output_size * 0.75) 
-    
-    if width > height:
-        new_w = inner_size
-        new_h = max(1, int(np.round(inner_size * (height / width))))
-    else:
-        new_h = inner_size
-        new_w = max(1, int(np.round(inner_size * (width / height))))
-        
-    resized_digit = cv2.resize(digit, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    
-    # Create the final black canvas and center the resized digit
-    final_image = np.zeros((output_size, output_size), dtype=np.uint8)
-    start_y = (output_size - new_h) // 2
-    start_x = (output_size - new_w) // 2
-    
-    final_image[start_y:start_y + new_h, start_x:start_x + new_w] = resized_digit
-    
-    return final_image
+    height, width = mask.shape
+    image_area = float(height * width)
+    center = np.array([width / 2.0, height / 2.0])
+    candidates: list[tuple[float, tuple[int, int, int, int, int]]] = []
+    for index in range(1, component_count):
+        x = int(stats[index, cv2.CC_STAT_LEFT])
+        y = int(stats[index, cv2.CC_STAT_TOP])
+        component_width = int(stats[index, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if component_width < 3 or component_height < 3:
+            continue
+        if area < max(12, round(image_area * 0.002)):
+            continue
+        aspect = component_width / max(component_height, 1)
+        if not 0.15 <= aspect <= 3.5:
+            continue
+
+        # A genuine digit can touch the original cell edge, but a component
+        # occupying most of the padded border is usually leftover grid.
+        touches_border = x == 0 or y == 0 or x + component_width == width or y + component_height == height
+        if touches_border and (
+            component_width > width * 0.4 or component_height > height * 0.4
+        ):
+            continue
+
+        fill_ratio = area / float(component_width * component_height)
+        distance = float(np.linalg.norm(centroids[index] - center) / max(width, height))
+        area_score = np.log1p(area) / np.log1p(image_area)
+        compactness_bonus = min(fill_ratio, 1.0)
+        score = 0.62 * area_score + 0.22 * compactness_bonus - 0.35 * distance
+        candidates.append((score, (index, x, y, component_width, component_height)))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def extract_digit_image(cell_image: np.ndarray, output_size: int = 28) -> np.ndarray:
+    """Extract one digit as a centered white-on-black image."""
+    empty = np.zeros((output_size, output_size), dtype=np.uint8)
+    if cell_image is None or cell_image.size == 0:
+        return empty
+
+    gray = cv2.cvtColor(cell_image, cv2.COLOR_BGR2GRAY) if cell_image.ndim == 3 else np.asarray(cell_image)
+    gray = gray.astype(np.uint8, copy=False)
+    gray = cv2.copyMakeBorder(gray, 3, 3, 3, 3, cv2.BORDER_REPLICATE)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 7
+    )
+
+    height, width = binary.shape
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, height // 3)))
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, width // 3), 1))
+    vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
+    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+    grid = cv2.bitwise_or(vertical, horizontal)
+    digit_mask = cv2.subtract(binary, grid)
+    digit_mask = cv2.morphologyEx(digit_mask, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+    digit_mask = cv2.dilate(digit_mask, np.ones((2, 2), np.uint8), iterations=1)
+
+    # Distance-transform thresholding suppresses thin remnants of grid lines.
+    distance = cv2.distanceTransform(digit_mask, cv2.DIST_L2, 5)
+    if distance.max() > 0:
+        _, distance_mask = cv2.threshold(distance, 0.25 * distance.max(), 255, cv2.THRESH_BINARY)
+        distance_mask = distance_mask.astype(np.uint8)
+        if cv2.countNonZero(distance_mask) >= max(12, round(digit_mask.size * 0.002)):
+            digit_mask = distance_mask
+
+    if cv2.countNonZero(digit_mask) < max(18, round(digit_mask.size * 0.003)):
+        return empty
+    bounds = _select_digit_component(digit_mask)
+    if bounds is None:
+        return empty
+
+    component_index, x, y, component_width, component_height = bounds
+    _, labels, _, _ = cv2.connectedComponentsWithStats(digit_mask, connectivity=8)
+    component = (labels[y:y + component_height, x:x + component_width] == component_index).astype(np.uint8) * 255
+    padding = 2
+    component = cv2.copyMakeBorder(component, padding, padding, padding, padding, cv2.BORDER_CONSTANT, value=0)
+
+    target = max(1, int(round(output_size * 0.75)))
+    scale = target / max(component.shape)
+    resized_width = max(1, int(round(component.shape[1] * scale)))
+    resized_height = max(1, int(round(component.shape[0] * scale)))
+    resized = cv2.resize(component, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+    result = np.zeros((output_size, output_size), dtype=np.uint8)
+    start_y = (output_size - resized_height) // 2
+    start_x = (output_size - resized_width) // 2
+    result[start_y:start_y + resized_height, start_x:start_x + resized_width] = resized
+    return result
