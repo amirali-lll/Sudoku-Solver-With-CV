@@ -88,10 +88,31 @@ class SudokuPipeline:
         """Save intermediate images and metadata for one pipeline run."""
         debug_dir.mkdir(parents=True, exist_ok=True)
         preprocessed = preprocess_for_contours(image)
-        contour = find_board_contour(preprocessed)
+
+        # Do not detect the board a second time for the debug image.  The
+        # pipeline already used ``matrix`` to create ``warped_board.jpg``.
+        # Running find_board_contour again can select a different candidate,
+        # especially when the grayscale Canny fallback and the thresholded
+        # contour candidates rank similarly.  Recover the exact source corners
+        # from the transform that produced the warped board instead.
+        warped_corners = np.array(
+            [[0, 0], [self.config.board_size - 1, 0],
+             [self.config.board_size - 1, self.config.board_size - 1],
+             [0, self.config.board_size - 1]],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+        inverse_matrix = np.linalg.inv(matrix)
+        contour = cv2.perspectiveTransform(warped_corners, inverse_matrix)
 
         contour_image = image.copy()
-        cv2.drawContours(contour_image, [contour.astype(np.int32)], -1, (0, 255, 0), 3)
+        cv2.polylines(
+            contour_image,
+            [np.round(contour).astype(np.int32)],
+            isClosed=True,
+            color=(0, 255, 0),
+            thickness=3,
+            lineType=cv2.LINE_AA,
+        )
         cv2.imwrite(str(debug_dir / "01_original.jpg"), image)
         cv2.imwrite(str(debug_dir / "02_contours_preprocessed.png"), preprocessed)
         cv2.imwrite(str(debug_dir / "03_detected_board_contour.jpg"), contour_image)

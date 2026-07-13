@@ -244,7 +244,7 @@ def extract_board(image: np.ndarray, size: int = 450) -> Tuple[np.ndarray, np.nd
     preprocessed = preprocess_for_contours(image)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) # Fix: generate gray image here
     contour = find_board_contour(preprocessed, gray_image=gray) # Fix: pass gray image down
-    # return warp_board(image, contour, size=size)
+    return warp_board(image, contour, size=size)
     return _warp(image, contour, size)
 
 
