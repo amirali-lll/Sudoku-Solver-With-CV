@@ -20,6 +20,7 @@ from .grid import (
     preprocess_for_contours,
     split_cells,
 )
+from .helper import make_grid_compilation
 from .solver import solve_sudoku
 
 LOGGER = logging.getLogger(__name__)
@@ -44,11 +45,18 @@ class SudokuPipeline:
         warped_board: np.ndarray,
         debug_dir: Path | None = None,
     ) -> Tuple[List[List[int]], List[List[float]]]:
+        LOGGER.info("Cleaning whole board before splitting")
+
+        
         LOGGER.info("Splitting warped board into 81 cells")
         cells = split_cells(warped_board)
         board: List[List[int]] = []
         confidences: List[List[float]] = []
 
+
+        raw_cells_for_debug: List[np.ndarray] = []
+        processed_digits_for_debug: List[np.ndarray] = []
+        
         if debug_dir is not None:
             cells_dir = debug_dir / "cells"
             digits_dir = debug_dir / "digits"
@@ -65,6 +73,8 @@ class SudokuPipeline:
                     cell_name = f"r{row_index + 1}c{col_index + 1}.png"
                     cv2.imwrite(str(debug_dir / "cells" / cell_name), cell)
                     cv2.imwrite(str(debug_dir / "digits" / cell_name), digit_image)
+                    raw_cells_for_debug.append(cell)
+                    processed_digits_for_debug.append(digit_image)
                 prediction, confidence = classify_digit(
                     self.model,
                     digit_image,
@@ -86,6 +96,20 @@ class SudokuPipeline:
                 row,
                 " ".join(f"{value:.2f}" for value in row_confidence),
             )
+            
+        # --- NEW DEBUG SAVING LOGIC ---
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate the 9x9 visual grids
+            raw_compilation = make_grid_compilation(raw_cells_for_debug)
+            digit_compilation = make_grid_compilation(processed_digits_for_debug)
+            
+            # Save them
+            cv2.imwrite(str(debug_dir / "06_raw_cells_grid.jpg"), raw_compilation)
+            cv2.imwrite(str(debug_dir / "07_processed_digits_grid.jpg"), digit_compilation)
+            LOGGER.info("Saved 9x9 cell compilations to debug directory.")
+            
 
         LOGGER.info("Digit recognition complete: %d filled cells", sum(value != 0 for row in board for value in row))
         return board, confidences
@@ -256,14 +280,22 @@ class SudokuPipeline:
                     (center_x, center_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1.0,
-                    (0, 0, 255),
+                    (159, 159, 146),
                     2,
                     lineType=cv2.LINE_AA,
                 )
 
         inverse_matrix = np.linalg.inv(board_matrix)
-        overlay = cv2.warpPerspective(solved_canvas, inverse_matrix, (original_image.shape[1], original_image.shape[0]))
-        combined = cv2.addWeighted(original_image, 1.0, overlay, 1.0, 0.0)
+        overlay = cv2.warpPerspective(
+            solved_canvas,
+            inverse_matrix,
+            (original_image.shape[1], original_image.shape[0])
+        )
+        mask = overlay[:, :, 2] > 0
+
+        combined = original_image.copy()
+        combined[mask] = overlay[mask]
+        # combined = cv2.addWeighted(original_image, 1.0, overlay, 3.0, 0.0)
         return combined
 
     def solve_image(

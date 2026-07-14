@@ -197,11 +197,6 @@ def find_board_contour(binary_image: np.ndarray, gray_image: np.ndarray | None =
     candidates: list[tuple[float, np.ndarray]] = []
     seen: set[tuple[int, ...]] = set()
 
-    for points, bonus in _line_grid_candidates(binary_image, min_area):
-        area = cv2.contourArea(points)
-        candidates.append((_score_candidate(binary_image, points, area / image_area) + bonus, points))
-
-    # Fix: Use grayscale for Canny if provided; otherwise fallback to binary to protect the API
     canny_source = gray_image if gray_image is not None else binary_image
     canny = cv2.Canny(cv2.GaussianBlur(canny_source, (5, 5), 0), 50, 150)
     
@@ -248,119 +243,160 @@ def extract_board(image: np.ndarray, size: int = 450) -> Tuple[np.ndarray, np.nd
 
 
 def split_cells(board_image: np.ndarray) -> List[np.ndarray]:
-    """Split a warped board into 81 crops while removing grid-line borders."""
+    """Split a warped board into 81 crops while aggressively removing grid-line borders."""
     boundaries_y = np.rint(np.linspace(0, board_image.shape[0], 10)).astype(int)
     boundaries_x = np.rint(np.linspace(0, board_image.shape[1], 10)).astype(int)
     cells: List[np.ndarray] = []
+    
     for row in range(9):
         for column in range(9):
             y1, y2 = boundaries_y[row], boundaries_y[row + 1]
             x1, x2 = boundaries_x[column], boundaries_x[column + 1]
-            # Keep almost the entire cell.  Grid removal is performed after
-            # thresholding, so a large crop here could clip a real stroke.
-            margin_y = max(1, round((y2 - y1) * 0.015))
-            margin_x = max(1, round((x2 - x1) * 0.015))
+            
+            margin_y = 2
+            margin_x = 2
+            
             cells.append(board_image[y1 + margin_y:y2 - margin_y, x1 + margin_x:x2 - margin_x].copy())
     return cells
 
-
-def _select_digit_component(mask: np.ndarray) -> tuple[int, int, int, int, int] | None:
-    """Select the most digit-like component rather than simply the largest blob."""
-    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
+def _select_digit_component(mask: np.ndarray):
+    """
+    Returns (x, y, w, h) of the best digit component.
+    """
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask,
+        connectivity=8,
     )
-    if component_count <= 1:
+
+    if num_labels <= 1:
         return None
 
-    height, width = mask.shape
-    image_area = float(height * width)
-    center = np.array([width / 2.0, height / 2.0])
-    candidates: list[tuple[float, tuple[int, int, int, int, int]]] = []
-    for index in range(1, component_count):
-        x = int(stats[index, cv2.CC_STAT_LEFT])
-        y = int(stats[index, cv2.CC_STAT_TOP])
-        component_width = int(stats[index, cv2.CC_STAT_WIDTH])
-        component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
-        area = int(stats[index, cv2.CC_STAT_AREA])
-        if component_width < 3 or component_height < 3:
-            continue
-        if area < max(12, round(image_area * 0.002)):
-            continue
-        aspect = component_width / max(component_height, 1)
-        if not 0.15 <= aspect <= 3.5:
-            continue
+    h_img, w_img = mask.shape
+    img_area = h_img * w_img
+    center = np.array([w_img / 2, h_img / 2])
 
-        # A genuine digit can touch the original cell edge, but a component
-        # occupying most of the padded border is usually leftover grid.
-        touches_border = x == 0 or y == 0 or x + component_width == width or y + component_height == height
-        if touches_border and (
-            component_width > width * 0.4 or component_height > height * 0.4
-        ):
+    best_score = -1e9
+    best = None
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+
+        # ۱. کمی سخت‌گیری بیشتر روی ابعاد (نویزهای ریزتر از این قطعاً عدد نیستند)
+        if area < 25:
             continue
 
-        fill_ratio = area / float(component_width * component_height)
-        distance = float(np.linalg.norm(centroids[index] - center) / max(width, height))
-        area_score = np.log1p(area) / np.log1p(image_area)
-        compactness_bonus = min(fill_ratio, 1.0)
-        score = 0.62 * area_score + 0.22 * compactness_bonus - 0.35 * distance
-        candidates.append((score, (index, x, y, component_width, component_height)))
+        if w < 3 or h < 8:
+            continue
 
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: item[0])[1]
+        aspect = w / max(h, 1)
 
+        # عدد ۱ ممکن است لاغر باشد، اما معمولا aspect زیر 0.15 نویز خطی است
+        if aspect < 0.15 or aspect > 2.5:
+            continue
 
-def extract_digit_image(cell_image: np.ndarray, output_size: int = 28) -> np.ndarray:
-    """Extract one digit as a centered white-on-black image."""
+        cx, cy = centroids[i]
+
+        # محاسبه فاصله مرکز کامپوننت تا مرکز سلول
+        dist = np.linalg.norm(np.array([cx, cy]) - center)
+        dist_ratio = dist / max(w_img, h_img)
+
+        # ۲. فیلتر طلایی: اگر مرکزِ کامپوننت بیش از حد به لبه‌ها نزدیک باشد (دور از مرکز)، 
+        # آن را نادیده می‌گیریم. خطوط جدول معمولاً dist_ratio بالای 0.4 دارند.
+        if dist_ratio > 0.25:
+            continue
+
+        fill = area / (w * h)
+        area_score = area / img_area
+        
+        # ۳. وزن‌دهی بهتر: جریمه کردن فاصله‌های دور از مرکز در امتیاز نهایی
+        score = (
+            area_score * 5
+            + fill * 2
+            - dist_ratio * 4  # افزایش ضریب منفی برای کامپوننت‌های غیرمرکزی
+        )
+
+        if score > best_score:
+            best_score = score
+            best = (x, y, w, h)
+
+    return best
+
+def extract_digit_image(cell: np.ndarray, output_size: int = 28):
+
     empty = np.zeros((output_size, output_size), dtype=np.uint8)
-    if cell_image is None or cell_image.size == 0:
+
+    if cell is None or cell.size == 0:
         return empty
 
-    gray = cv2.cvtColor(cell_image, cv2.COLOR_BGR2GRAY) if cell_image.ndim == 3 else np.asarray(cell_image)
-    gray = gray.astype(np.uint8, copy=False)
-    gray = cv2.copyMakeBorder(gray, 3, 3, 3, 3, cv2.BORDER_REPLICATE)
+    if cell.ndim == 3:
+        gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = cell.copy()
+
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
     binary = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 7
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        8,
     )
 
-    height, width = binary.shape
-    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, height // 3)))
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, width // 3), 1))
-    vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
-    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
-    grid = cv2.bitwise_or(vertical, horizontal)
-    digit_mask = cv2.subtract(binary, grid)
-    digit_mask = cv2.morphologyEx(digit_mask, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
-    digit_mask = cv2.dilate(digit_mask, np.ones((2, 2), np.uint8), iterations=1)
+    # فقط اتصال با خط جدول را قطع می‌کنیم
+    border = 2
+    binary[:border, :] = 0
+    binary[-border:, :] = 0
+    binary[:, :border] = 0
+    binary[:, -border:] = 0
 
-    # Distance-transform thresholding suppresses thin remnants of grid lines.
-    distance = cv2.distanceTransform(digit_mask, cv2.DIST_L2, 5)
-    if distance.max() > 0:
-        _, distance_mask = cv2.threshold(distance, 0.25 * distance.max(), 255, cv2.THRESH_BINARY)
-        distance_mask = distance_mask.astype(np.uint8)
-        if cv2.countNonZero(distance_mask) >= max(12, round(digit_mask.size * 0.002)):
-            digit_mask = distance_mask
+    component = _select_digit_component(binary)
 
-    if cv2.countNonZero(digit_mask) < max(18, round(digit_mask.size * 0.003)):
-        return empty
-    bounds = _select_digit_component(digit_mask)
-    if bounds is None:
+    if component is None:
         return empty
 
-    component_index, x, y, component_width, component_height = bounds
-    _, labels, _, _ = cv2.connectedComponentsWithStats(digit_mask, connectivity=8)
-    component = (labels[y:y + component_height, x:x + component_width] == component_index).astype(np.uint8) * 255
-    padding = 2
-    component = cv2.copyMakeBorder(component, padding, padding, padding, padding, cv2.BORDER_CONSTANT, value=0)
+    x, y, w, h = component
 
-    target = max(1, int(round(output_size * 0.75)))
-    scale = target / max(component.shape)
-    resized_width = max(1, int(round(component.shape[1] * scale)))
-    resized_height = max(1, int(round(component.shape[0] * scale)))
-    resized = cv2.resize(component, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+    digit = binary[y:y+h, x:x+w]
+
+    if digit.size == 0:
+        return empty
+
+    padding = 3
+
+    digit = cv2.copyMakeBorder(
+        digit,
+        padding,
+        padding,
+        padding,
+        padding,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+
+    target = int(output_size * 0.72)
+
+    scale = target / max(digit.shape)
+
+    new_w = max(1, int(digit.shape[1] * scale))
+    new_h = max(1, int(digit.shape[0] * scale))
+
+    digit = cv2.resize(
+        digit,
+        (new_w, new_h),
+        interpolation=cv2.INTER_AREA,
+    )
+
     result = np.zeros((output_size, output_size), dtype=np.uint8)
-    start_y = (output_size - resized_height) // 2
-    start_x = (output_size - resized_width) // 2
-    result[start_y:start_y + resized_height, start_x:start_x + resized_width] = resized
+
+    sx = (output_size - new_w) // 2
+    sy = (output_size - new_h) // 2
+
+    result[sy:sy+new_h, sx:sx+new_w] = digit
+
     return result
